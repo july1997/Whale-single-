@@ -4,17 +4,80 @@ using Unity.Entities;
 using Unity.Jobs;
 using Unity.Mathematics;
 using Unity.Transforms;
+using Unity.Rendering;
 
 //debug.log用
 using UnityEngine;
 
+[AlwaysUpdateSystem]
+[UpdateBefore(typeof(BoidsSimulationSystem))]
+public class BoidsEntityGenerationSystem : ComponentSystem
+{
+    EntityArchetype archetype;
+    EntityQuery group;
+    Unity.Mathematics.Random random;
+
+    protected override void OnCreate()
+    {
+        if (!Bootstrap.IsValid) return;
+
+         archetype = EntityManager.CreateArchetype(
+            typeof(Translation),
+            typeof(Rotation),
+            typeof(NonUniformScale),
+            typeof(Velocity),
+            typeof(Acceleration),
+            typeof(NeighborsEntityBuffer),
+            typeof(RenderMesh),
+            typeof(RenderBounds),
+            typeof(LocalToWorld));
+
+        group = GetEntityQuery(archetype.GetComponentTypes());
+
+        random = new Unity.Mathematics.Random(853);
+    }
+
+    protected override void OnUpdate()
+    {
+        if (!Bootstrap.IsValid) return;
+
+        var entities = group.ToEntityArray(Allocator.TempJob);
+        for (int i = 0; i < entities.Length - Bootstrap.Boid.count; ++i)
+        {
+            PostUpdateCommands.DestroyEntity(entities[i]);
+        }
+        for (int i = 0; i < Bootstrap.Boid.count - entities.Length; ++i)
+        {
+            CreateEntity();
+        }
+    }
+
+     void CreateEntity()
+    {
+        var scale = Bootstrap.Boid.scale;
+        var renderer = Bootstrap.Boid.renderer;
+        var initSpeed = Bootstrap.Param.initSpeed;
+        var newEntity = PostUpdateCommands.CreateEntity(archetype);
+        PostUpdateCommands.SetComponent(newEntity, new Translation { Value = random.NextFloat3(1f) });
+        PostUpdateCommands.SetComponent(newEntity, new Rotation { Value = quaternion.identity });
+        PostUpdateCommands.SetComponent(newEntity, new NonUniformScale { Value = new float3(scale.x, scale.y, scale.z) });
+        PostUpdateCommands.AddComponent(newEntity, new Velocity { Value = random.NextFloat3Direction() * initSpeed });
+        PostUpdateCommands.AddComponent(newEntity, new Acceleration { Value = float3.zero });
+        // Dynamic Buffer の追加
+        PostUpdateCommands.AddBuffer<NeighborsEntityBuffer>(newEntity);
+        PostUpdateCommands.SetSharedComponent(newEntity, renderer);
+    }
+}
+
 public class BoidsSimulationSystem : JobComponentSystem
 {
     EntityQuery group;
+    EntityQuery playerGroup;
 
     protected override void OnCreate()
     {
         group = GetEntityQuery(typeof(Translation), typeof(Velocity), typeof(NeighborsEntityBuffer));
+        playerGroup = GetEntityQuery(typeof(Translation), typeof(PlayerCommandData));
     }
 
     [BurstCompile]
@@ -23,7 +86,9 @@ public class BoidsSimulationSystem : JobComponentSystem
         [ReadOnly] public float prodThresh;
         [ReadOnly] public float distThresh;
         [ReadOnly] public ComponentDataFromEntity<Translation> positionFromEntity;
-        [ReadOnly] public BufferFromEntity<NeighborsEntityBuffer> neighborsFromEntity;
+        // NativeDisableParallelForRestriction:重要
+        // ただランダムアクセスが頻発することになるのでパフォーマンス面でデメリットがありそう
+        [NativeDisableParallelForRestriction] public BufferFromEntity<NeighborsEntityBuffer> neighborsFromEntity;
         [ReadOnly] public NativeArray<Entity> entities;
 
         public void Execute(
@@ -165,6 +230,60 @@ public class BoidsSimulationSystem : JobComponentSystem
         }
     }
 
+    /*
+    [BurstCompile]
+    private struct PlayerMoveJob : IJobForEach<Translation, Rotation, PlayerCommandData>
+    {
+        public float dt;
+        [ReadOnly] public float minSpeed;
+        [ReadOnly] public float maxSpeed;
+
+        public void Execute(ref Translation pos, ref Rotation rot, ref PlayerCommandData playercommanddata)
+        {
+            var v = playercommanddata.value * dt;
+            var dir = math.normalize(v);
+
+            pos = new Translation { Value = pos.Value + v * dt };
+            rot = new Rotation { Value = quaternion.LookRotationSafe(dir, new float3(0, 1, 0)) }; 
+            playercommanddata = new PlayerCommandData{ value = float3.zero };
+        }
+    }
+    private struct PlayerMoveChangeJob : IJobForEach<PlayerCommandData>
+    {
+        public float3 Force;
+        public void Execute(ref PlayerCommandData playercommanddata)
+        {
+            playercommanddata.value = Force;
+        }
+    }
+    */
+
+    [BurstCompile]
+    public struct PlayerJob : IJobForEach<Translation, Acceleration>
+    {
+        [ReadOnly] public float separationWeight;
+        [ReadOnly] public NativeArray<Translation> playerEntities;
+
+        public void Execute([ReadOnly] ref Translation pos, ref Acceleration accel)
+        {
+            if (playerEntities.Length == 0) return;
+
+            var pos0 = pos.Value;
+
+            var force = float3.zero;
+            for (int i = 0; i < playerEntities.Length; ++i)
+            {
+                var pos1 = playerEntities[i].Value;
+                var distance = math.abs(pos0 - pos1);
+                force += (math.normalize(pos0 - pos1)  * separationWeight )/ math.pow(distance, 2);
+            }
+            force /= playerEntities.Length;
+
+            var dAccel = force;
+            accel = new Acceleration { Value = accel.Value + dAccel };
+        }
+    }
+
     [BurstCompile]
     private struct MoveJob : IJobForEach<Translation, Rotation, Velocity, Acceleration>
     {
@@ -186,6 +305,7 @@ public class BoidsSimulationSystem : JobComponentSystem
             accel = new Acceleration { Value = float3.zero };
         }
     }
+
     protected override JobHandle OnUpdate(JobHandle inputDeps)
     {
         var neighbors = new NeighborsDetectionJob
@@ -225,18 +345,58 @@ public class BoidsSimulationSystem : JobComponentSystem
             positionFromEntity = GetComponentDataFromEntity<Translation>(true),
         };
 
+        /*
+        var playemovechangejob = new PlayerMoveChangeJob();
+
+        if (Input.GetKey(KeyCode.LeftArrow))
+        {
+            playemovechangejob.Force = math.float3(-1, 0, 0);
+        }
+
+        if (Input.GetKey(KeyCode.RightArrow))
+        {
+            playemovechangejob.Force = math.float3(-1, 0, 0);
+        }
+
+        if (Input.GetKey(KeyCode.UpArrow))
+        {
+            playemovechangejob.Force = math.float3(0, 0, 1);
+        }
+
+        if (Input.GetKey(KeyCode.DownArrow))
+        {
+            playemovechangejob.Force = math.float3(0, 0, -1);
+        }
+
+        var playermove = new PlayerMoveJob
+        {
+            dt = Time.DeltaTime,
+            minSpeed = Bootstrap.Param.minSpeed,
+            maxSpeed = Bootstrap.Param.maxSpeed,
+        };
+        */
+
+        var player = new PlayerJob()
+        {
+            separationWeight = Bootstrap.Param.separationWeight,
+            playerEntities = playerGroup.ToComponentDataArray<Translation>(Allocator.TempJob),
+        };
+
         var move = new MoveJob
         {
             dt = Time.DeltaTime,
             minSpeed = Bootstrap.Param.minSpeed,
             maxSpeed = Bootstrap.Param.maxSpeed,
         };
-
+        
         inputDeps = neighbors.Schedule(this, inputDeps);
         inputDeps = wall.Schedule(this, inputDeps);
         inputDeps = separation.Schedule(this, inputDeps);
         inputDeps = alignment.Schedule(this, inputDeps);
         inputDeps = cohesion.Schedule(this, inputDeps);
+        //inputDeps = playermove.Schedule(this, inputDeps);
+        //inputDeps = playemovechangejob.Schedule(this, inputDeps);
+        inputDeps = player.Schedule(this, inputDeps);
         inputDeps = move.Schedule(this, inputDeps);
         return inputDeps;
     }
